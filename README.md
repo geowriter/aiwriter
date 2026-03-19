@@ -1,2 +1,3 @@
 # aiwriter
-Official AI Writing Skills &amp; Prompt Standards for geowriter.ai content
+
+GeoWriter skill for generating GEO article bundles and publishing them to WordPress through GeoWriter publish configs.
