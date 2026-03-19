@@ -160,6 +160,133 @@ class AIWriterTest(unittest.TestCase):
         self.assertEqual(sleep.call_args_list, [mock.call(1.0)])
         http_error.close()
 
+    def test_request_json_retries_get_after_url_error(self) -> None:
+        url = "https://example.com/api/v1/documents/detail/doc-1"
+        response = mock.MagicMock()
+        response.read.return_value = json.dumps({"success": True, "data": {"id": "doc-1"}}).encode("utf-8")
+        response.__enter__.return_value = response
+        response.__exit__.return_value = None
+
+        with mock.patch.object(
+            MODULE.request,
+            "urlopen",
+            side_effect=[
+                urllib.error.URLError("network down"),
+                response,
+            ],
+        ) as urlopen:
+            with mock.patch.object(MODULE.time, "sleep") as sleep:
+                payload = MODULE.request_json("GET", url, api_key="sk-gw-test", timeout=30)
+
+        self.assertEqual(payload, {"id": "doc-1"})
+        self.assertEqual(urlopen.call_count, 2)
+        self.assertEqual(sleep.call_args_list, [mock.call(10.0)])
+
+    def test_request_json_retries_retryable_http_status_for_get(self) -> None:
+        url = "https://example.com/api/v1/documents/progress/doc-1"
+        response = mock.MagicMock()
+        response.read.return_value = json.dumps({"success": True, "data": {"completed": True}}).encode("utf-8")
+        response.__enter__.return_value = response
+        response.__exit__.return_value = None
+        http_error = urllib.error.HTTPError(
+            url,
+            503,
+            "Service Unavailable",
+            hdrs=None,
+            fp=io.BytesIO(json.dumps({"message": "upstream unavailable"}).encode("utf-8")),
+        )
+
+        with mock.patch.object(
+            MODULE.request,
+            "urlopen",
+            side_effect=[
+                http_error,
+                response,
+            ],
+        ) as urlopen:
+            with mock.patch.object(MODULE.time, "sleep") as sleep:
+                payload = MODULE.request_json("GET", url, api_key="sk-gw-test", timeout=30)
+
+        self.assertEqual(payload, {"completed": True})
+        self.assertEqual(urlopen.call_count, 2)
+        self.assertEqual(sleep.call_args_list, [mock.call(10.0)])
+        http_error.close()
+
+    def test_request_json_does_not_retry_non_retryable_http_status_for_get(self) -> None:
+        url = "https://example.com/api/v1/documents/detail/doc-1"
+        http_error = urllib.error.HTTPError(
+            url,
+            400,
+            "Bad Request",
+            hdrs=None,
+            fp=io.BytesIO(json.dumps({"message": "bad request"}).encode("utf-8")),
+        )
+
+        with mock.patch.object(MODULE.request, "urlopen", side_effect=[http_error]) as urlopen:
+            with mock.patch.object(MODULE.time, "sleep") as sleep:
+                with self.assertRaises(MODULE.ApiError) as ctx:
+                    MODULE.request_json("GET", url, api_key="sk-gw-test", timeout=30)
+
+        self.assertIn("bad request", str(ctx.exception))
+        self.assertEqual(urlopen.call_count, 1)
+        sleep.assert_not_called()
+        http_error.close()
+
+    def test_request_json_does_not_retry_post_by_default(self) -> None:
+        url = "https://example.com/api/v1/documents/publish/submit/doc-1"
+        http_error = urllib.error.HTTPError(
+            url,
+            503,
+            "Service Unavailable",
+            hdrs=None,
+            fp=io.BytesIO(json.dumps({"message": "temporary upstream issue"}).encode("utf-8")),
+        )
+
+        with mock.patch.object(MODULE.request, "urlopen", side_effect=[http_error]) as urlopen:
+            with mock.patch.object(MODULE.time, "sleep") as sleep:
+                with self.assertRaises(MODULE.ApiError) as ctx:
+                    MODULE.request_json(
+                        "POST",
+                        url,
+                        api_key="sk-gw-test",
+                        payload={"publish_config_id": 7},
+                        timeout=30,
+                    )
+
+        self.assertIn("temporary upstream issue", str(ctx.exception))
+        self.assertEqual(urlopen.call_count, 1)
+        sleep.assert_not_called()
+        http_error.close()
+
+    def test_create_document_enables_retry_for_idempotent_post(self) -> None:
+        with mock.patch.object(MODULE, "request_json", return_value={"document_id": "doc-1"}) as request_json:
+            payload = MODULE.create_document(
+                base_url="https://example.com",
+                api_key="sk-gw-test",
+                keyword="best hiking trails",
+                language="en",
+                country="united-states",
+                need_image=True,
+                idempotency_key="idem-key",
+                request_timeout=30,
+            )
+
+        self.assertEqual(payload, {"document_id": "doc-1"})
+        request_json.assert_called_once_with(
+            "POST",
+            "https://example.com/api/v1/documents/create",
+            api_key="sk-gw-test",
+            payload={
+                "keyword": "best hiking trails",
+                "language": "en",
+                "country": "united-states",
+                "need_image": True,
+                "idempotency_key": "idem-key",
+            },
+            timeout=30,
+            retryable=True,
+        )
+
     def test_resolve_settings_prefers_cli_over_env(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             env_path = Path(tmp_dir) / ".env"

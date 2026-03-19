@@ -12,6 +12,12 @@
 - `GW_PUBLISH_TIMEOUT_SECONDS`: end-to-end publish timeout
 - `GW_ARTICLES_DIR`: local root for article bundles
 
+## Runtime Notes
+
+- Generation and publish are remote long-running jobs. It is normal for them to take several minutes, often around 5 minutes.
+- Once a job is started, prefer waiting for progress polling instead of resubmitting the same command immediately.
+- Safe requests retry automatically on transient network failures. Publish submission is not blindly retried to avoid duplicate publish tasks.
+
 ## Authentication
 
 All requests use:

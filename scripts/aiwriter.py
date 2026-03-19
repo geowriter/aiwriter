@@ -8,6 +8,7 @@ import json
 import mimetypes
 import os
 import re
+import socket
 import sys
 import time
 import uuid
@@ -37,14 +38,53 @@ DEFAULTS = {
 
 DEFAULT_DOWNLOAD_RETRY_COUNT = 3
 DEFAULT_DOWNLOAD_RETRY_DELAY_SECONDS = 1.0
+DEFAULT_API_RETRY_COUNT = 3
+DEFAULT_API_RETRY_DELAY_SECONDS = 10.0
 DEFAULT_DOWNLOAD_USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0 Safari/537.36"
 )
+RETRYABLE_HTTP_STATUS_CODES = {408, 425, 429, 500, 502, 503, 504}
 
 
 class ApiError(RuntimeError):
     pass
+
+
+def parse_http_error_message(exc: error.HTTPError) -> str:
+    body = exc.read().decode("utf-8", errors="replace")
+    try:
+        error_payload = json.loads(body)
+        return error_payload.get("message") or body or f"HTTP {exc.code}"
+    except json.JSONDecodeError:
+        return body or str(exc) or f"HTTP {exc.code}"
+
+
+def format_request_error(method: str, url: str, detail: str, *, attempts: int = 1) -> str:
+    message = f"{method.upper()} {url} failed"
+    if attempts > 1:
+        message += f" after {attempts} attempts"
+    return f"{message}: {detail}"
+
+
+def log_request_retry(method: str, url: str, *, attempt: int, retries: int, detail: str, retry_delay: float) -> None:
+    print(
+        (
+            f"[aiwriter] {method.upper()} {url} failed "
+            f"(attempt {attempt}/{retries}): {detail}. Retrying in {retry_delay:g}s."
+        ),
+        file=sys.stderr,
+    )
+
+
+def log_long_running_notice(operation: str) -> None:
+    print(
+        (
+            f"[aiwriter] {operation} may take several minutes, often around 5 minutes. "
+            "Waiting for progress updates; do not resubmit unless the timeout is reached."
+        ),
+        file=sys.stderr,
+    )
 
 
 def parse_env_text(text: str) -> dict[str, str]:
@@ -262,6 +302,9 @@ def request_json(
     api_key: str,
     payload: dict[str, Any] | None = None,
     timeout: int = 30,
+    retries: int = DEFAULT_API_RETRY_COUNT,
+    retry_delay: float = DEFAULT_API_RETRY_DELAY_SECONDS,
+    retryable: bool | None = None,
 ) -> dict[str, Any]:
     data: bytes | None = None
     headers = {
@@ -274,30 +317,74 @@ def request_json(
         headers["Content-Type"] = "application/json"
 
     req = request.Request(url=url, method=method.upper(), headers=headers, data=data)
+    retryable = method.upper() == "GET" if retryable is None else retryable
+    max_attempts = retries if retryable else 1
 
-    try:
-        with request.urlopen(req, timeout=timeout) as response:
-            body = response.read().decode("utf-8")
-    except error.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
+    for attempt in range(1, max_attempts + 1):
         try:
-            error_payload = json.loads(body)
-            message = error_payload.get("message") or body
-        except json.JSONDecodeError:
-            message = body or str(exc)
-        raise ApiError(f"{method.upper()} {url} failed: {message}") from exc
-    except error.URLError as exc:
-        raise ApiError(f"{method.upper()} {url} failed: {exc}") from exc
+            with request.urlopen(req, timeout=timeout) as response:
+                body = response.read().decode("utf-8")
+        except error.HTTPError as exc:
+            detail = parse_http_error_message(exc)
+            if retryable and exc.code in RETRYABLE_HTTP_STATUS_CODES and attempt < max_attempts:
+                log_request_retry(
+                    method,
+                    url,
+                    attempt=attempt,
+                    retries=max_attempts,
+                    detail=f"HTTP {exc.code}: {detail}",
+                    retry_delay=retry_delay,
+                )
+                time.sleep(retry_delay)
+                continue
+            raise ApiError(
+                format_request_error(
+                    method,
+                    url,
+                    detail,
+                    attempts=attempt,
+                )
+            ) from exc
+        except (
+            error.URLError,
+            TimeoutError,
+            socket.timeout,
+            ConnectionResetError,
+            http.client.IncompleteRead,
+            http.client.RemoteDisconnected,
+        ) as exc:
+            detail = str(exc) or exc.__class__.__name__
+            if retryable and attempt < max_attempts:
+                log_request_retry(
+                    method,
+                    url,
+                    attempt=attempt,
+                    retries=max_attempts,
+                    detail=detail,
+                    retry_delay=retry_delay,
+                )
+                time.sleep(retry_delay)
+                continue
+            raise ApiError(
+                format_request_error(
+                    method,
+                    url,
+                    detail,
+                    attempts=attempt,
+                )
+            ) from exc
 
-    try:
-        response_payload = json.loads(body)
-    except json.JSONDecodeError as exc:
-        raise ApiError(f"{method.upper()} {url} returned non-JSON response.") from exc
+        try:
+            response_payload = json.loads(body)
+        except json.JSONDecodeError as exc:
+            raise ApiError(f"{method.upper()} {url} returned non-JSON response.") from exc
 
-    if not response_payload.get("success", False):
-        raise ApiError(response_payload.get("message") or f"{method.upper()} {url} failed.")
+        if not response_payload.get("success", False):
+            raise ApiError(response_payload.get("message") or f"{method.upper()} {url} failed.")
 
-    return response_payload.get("data") or {}
+        return response_payload.get("data") or {}
+
+    raise ApiError(format_request_error(method, url, "request exhausted without a response", attempts=max_attempts))
 
 
 def build_download_headers(url: str) -> dict[str, str]:
@@ -375,6 +462,7 @@ def create_document(
             "idempotency_key": idempotency_key,
         },
         timeout=request_timeout,
+        retryable=True,
     )
 
 
@@ -471,6 +559,7 @@ def wait_for_document(
     generation_timeout: int,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     started_at = time.time()
+    log_long_running_notice("Document generation")
 
     while True:
         progress = get_document_progress(
@@ -510,6 +599,7 @@ def wait_for_publish(
     publish_timeout: int,
 ) -> dict[str, Any]:
     started_at = time.time()
+    log_long_running_notice("Publishing")
 
     while True:
         try:
@@ -999,7 +1089,12 @@ def add_generate_parser(subparsers: argparse._SubParsersAction[argparse.Argument
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Create and publish GeoWriter articles through the integration API.")
+    parser = argparse.ArgumentParser(
+        description=(
+            "Create and publish GeoWriter articles through the integration API. "
+            "Remote generation and publish steps can take several minutes, often around five minutes."
+        )
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     init_parser = subparsers.add_parser("init", help="Interactively initialize a .env file.")

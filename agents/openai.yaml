@@ -1,4 +1,4 @@
 interface:
   display_name: "AIWriter"
-  short_description: "Generate GeoWriter article bundles and publish them to WordPress."
-  default_prompt: "Use GeoWriter to generate a local article bundle with Markdown, metadata, and downloaded attachments, or publish an existing article bundle to WordPress through a GeoWriter publish config."
+  short_description: "Generate GeoWriter article bundles and publish them to WordPress. Remote jobs may take around five minutes."
+  default_prompt: "Use GeoWriter to generate a local article bundle with Markdown, metadata, and downloaded attachments, or publish an existing article bundle to WordPress through a GeoWriter publish config. Remote generation and publish jobs can take several minutes, often around five minutes, so wait for polling output instead of resubmitting immediately."
