@@ -1,14 +1,15 @@
 ---
 name: aiwriter
-description: Generate GEO articles through the GeoWriter Integration API, store each article as a local bundle, and publish saved articles to WordPress through GeoWriter publish configs. Use when Codex needs `.env` setup, article generation, local Markdown cleanup with downloaded images, publish-config lookup, taxonomy lookup, or WordPress publishing.
+description: Generate GEO articles through the GeoWriter Integration API, add AI-generated illustrations to markdown articles, store each article as a local bundle, and publish saved articles to WordPress through GeoWriter publish configs. Use when Codex needs `.env` setup, article generation, illustration, local Markdown cleanup with downloaded images, publish-config lookup, taxonomy lookup, or WordPress publishing.
 ---
 
 # AIWriter
 
-Use this skill for two workflows:
+Use this skill for three workflows:
 
 1. Generate an article through GeoWriter.
-2. Publish a generated article bundle to WordPress through a GeoWriter publish config.
+2. Add AI-generated illustrations (cover + body images) to a markdown article.
+3. Publish a generated article bundle to WordPress through a GeoWriter publish config.
 
 ## Runtime Expectations
 
@@ -27,7 +28,14 @@ Use this skill for two workflows:
 3. If the article already has a local bundle, resume against the same directory instead of creating a new one.
    - Run:
    - `python3 /Users/striver/workspace/sectojoy/aiwriter/scripts/aiwriter.py generate --article-dir path/to/article-bundle`
-4. Discover publish configs or taxonomy when the user needs to publish.
+4. Add illustrations to a markdown article.
+   - From a standalone file:
+   - `python3 /Users/striver/workspace/sectojoy/aiwriter/scripts/aiwriter.py illustrate path/to/article.md`
+   - From an existing article bundle:
+   - `python3 /Users/striver/workspace/sectojoy/aiwriter/scripts/aiwriter.py illustrate --article-dir path/to/article-bundle`
+   - With options:
+   - `python3 /Users/striver/workspace/sectojoy/aiwriter/scripts/aiwriter.py illustrate path/to/article.md --max-images 5 --cover-style cinematic`
+5. Discover publish configs or taxonomy when the user needs to publish.
    - Run:
    - `python3 /Users/striver/workspace/sectojoy/aiwriter/scripts/aiwriter.py configs`
    - `python3 /Users/striver/workspace/sectojoy/aiwriter/scripts/aiwriter.py taxonomy 12`
@@ -49,7 +57,9 @@ Bundle contents:
 - `document.json`: raw GeoWriter document detail payload
 - `generation.json`: raw generation request/response/progress state
 - `publish.json`: publish attempts and final publish progress
-- `images/`: downloaded images referenced from `article.md` with relative paths like `images/image-1.png`
+- `illustrated.md`: illustrated Markdown with cover and body images (after illustrate)
+- `illustration.json`: raw illustration request/response/progress state
+- `images/`: downloaded images referenced from `article.md` and `illustrated.md` with relative paths like `images/image-1.png`
 
 The generate flow always creates or reuses a stable `article_key`. Unless overridden, that same value is sent as `idempotency_key` to support retries and local resume behavior.
 
@@ -65,6 +75,16 @@ The generate flow always creates or reuses a stable `article_key`. Unless overri
   - `python3 /Users/striver/workspace/sectojoy/aiwriter/scripts/aiwriter.py generate --article-dir output/articles/best-hiking-trails-20260319-121732`
 - Force a caller-supplied idempotency key:
   - `python3 /Users/striver/workspace/sectojoy/aiwriter/scripts/aiwriter.py generate "best hiking trails" --idempotency-key retry-key-001`
+- Illustrate a markdown article:
+  - `python3 /Users/striver/workspace/sectojoy/aiwriter/scripts/aiwriter.py illustrate path/to/article.md`
+- Illustrate and emit JSON summary:
+  - `python3 /Users/striver/workspace/sectojoy/aiwriter/scripts/aiwriter.py illustrate path/to/article.md --format json`
+- Illustrate an existing article bundle:
+  - `python3 /Users/striver/workspace/sectojoy/aiwriter/scripts/aiwriter.py illustrate --article-dir output/articles/best-hiking-trails-20260319-121732`
+- Illustrate with custom options:
+  - `python3 /Users/striver/workspace/sectojoy/aiwriter/scripts/aiwriter.py illustrate path/to/article.md --max-images 5 --cover-style cinematic --aspect-ratio 16:9 --resolution 2k`
+- Illustrate with cover only (no body images):
+  - `python3 /Users/striver/workspace/sectojoy/aiwriter/scripts/aiwriter.py illustrate path/to/article.md --max-images 0`
 - List publish configs:
   - `python3 /Users/striver/workspace/sectojoy/aiwriter/scripts/aiwriter.py configs`
 - Inspect taxonomy for a config:
@@ -93,6 +113,8 @@ Optional:
 - `GW_REQUEST_TIMEOUT_SECONDS`
 - `GW_GENERATION_TIMEOUT_SECONDS`
 - `GW_PUBLISH_TIMEOUT_SECONDS`
+- `GW_ILLUSTRATION_POLL_INTERVAL_SECONDS`
+- `GW_ILLUSTRATION_TIMEOUT_SECONDS`
 - `GW_ARTICLES_DIR`
 
 Only these keys are read from `.env`.

@@ -47,6 +47,8 @@ class AIWriterTest(unittest.TestCase):
                     "GW_REQUEST_TIMEOUT_SECONDS": "30",
                     "GW_GENERATION_TIMEOUT_SECONDS": "900",
                     "GW_PUBLISH_TIMEOUT_SECONDS": "600",
+                    "GW_ILLUSTRATION_POLL_INTERVAL_SECONDS": "10",
+                    "GW_ILLUSTRATION_TIMEOUT_SECONDS": "900",
                     "GW_ARTICLES_DIR": "/tmp/articles",
                 },
             )
@@ -56,6 +58,8 @@ class AIWriterTest(unittest.TestCase):
             self.assertIn("GW_API_KEY=sk-gw-test", content)
             self.assertIn("GW_PUBLISH_POLL_INTERVAL_SECONDS=11", content)
             self.assertIn("GW_PUBLISH_TIMEOUT_SECONDS=600", content)
+            self.assertIn("GW_ILLUSTRATION_POLL_INTERVAL_SECONDS=10", content)
+            self.assertIn("GW_ILLUSTRATION_TIMEOUT_SECONDS=900", content)
             self.assertIn("GW_ARTICLES_DIR=/tmp/articles", content)
 
     def test_build_article_dir_uses_slug_and_timestamp(self) -> None:
@@ -99,6 +103,46 @@ class AIWriterTest(unittest.TestCase):
             self.assertIn("https://cdn.example.com/missing.jpg", localized)
             self.assertEqual(failures, ["https://cdn.example.com/missing.jpg"])
             self.assertTrue((images_dir / "image-1.png").exists())
+
+    def test_normalize_image_url_strips_nonstandard_port(self) -> None:
+        self.assertEqual(
+            MODULE.normalize_image_url("https://imager.geowriter.ai:8081/images/cover-abc.png"),
+            "https://imager.geowriter.ai/images/cover-abc.png",
+        )
+        # Port-less URLs and other hosts are left untouched.
+        self.assertEqual(
+            MODULE.normalize_image_url("https://imager.geowriter.ai/images/cover.png"),
+            "https://imager.geowriter.ai/images/cover.png",
+        )
+        self.assertEqual(
+            MODULE.normalize_image_url("https://cdn.example.com:8081/img.png"),
+            "https://cdn.example.com:8081/img.png",
+        )
+
+    def test_localize_markdown_images_normalizes_imager_port(self) -> None:
+        # The service returns image URLs on an unreachable :8081 port; the skill
+        # must download from (and fall back to) the standard-host URL.
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            images_dir = Path(tmp_dir) / "images"
+            markdown = "![Cover](https://imager.geowriter.ai:8081/images/cover-xyz.png)"
+
+            captured: dict = {}
+
+            def fake_download(url: str, *, timeout: int) -> tuple[bytes, str | None]:
+                captured["url"] = url
+                raise MODULE.ApiError("blocked")
+
+            with mock.patch.object(MODULE, "download_binary", side_effect=fake_download):
+                localized, failures = MODULE.localize_markdown_images(
+                    markdown,
+                    images_dir=images_dir,
+                    request_timeout=30,
+                )
+
+            self.assertEqual(captured["url"], "https://imager.geowriter.ai/images/cover-xyz.png")
+            self.assertIn("https://imager.geowriter.ai/images/cover-xyz.png", localized)
+            self.assertNotIn(":8081", localized)
+            self.assertEqual(failures, ["https://imager.geowriter.ai/images/cover-xyz.png"])
 
     def test_build_download_headers_adds_geowriter_cdn_headers(self) -> None:
         headers = MODULE.build_download_headers(
@@ -822,6 +866,597 @@ class AIWriterTest(unittest.TestCase):
         args = parser.parse_args(["create", "best hiking trails"])
 
         self.assertIs(args.func, MODULE.cmd_generate)
+
+    # --- Illustration tests ---
+
+    def test_create_illustration_sends_expected_payload(self) -> None:
+        with mock.patch.object(MODULE, "request_json", return_value={"id": "illust-1", "status": "PENDING"}) as request_json:
+            payload = MODULE.create_illustration(
+                base_url="https://example.com",
+                api_key="sk-gw-test",
+                markdown="# Title\n\nBody",
+                cover=True,
+                cover_style="cinematic",
+                max_images=3,
+                image_styles=["photorealistic"],
+                platform="general",
+                aspect_ratio="16:9",
+                resolution="1k",
+                idempotency_key="idem-key",
+                request_timeout=30,
+            )
+
+        self.assertEqual(payload, {"id": "illust-1", "status": "PENDING"})
+        request_json.assert_called_once_with(
+            "POST",
+            "https://example.com/api/v1/illustration/create",
+            api_key="sk-gw-test",
+            payload={
+                "markdown": "# Title\n\nBody",
+                "cover": True,
+                "cover_style": "cinematic",
+                "max_images": 3,
+                "image_styles": ["photorealistic"],
+                "platform": "general",
+                "aspect_ratio": "16:9",
+                "resolution": "1k",
+                "idempotency_key": "idem-key",
+            },
+            timeout=30,
+            retryable=True,
+        )
+
+    def test_get_illustration_progress_calls_correct_endpoint(self) -> None:
+        with mock.patch.object(
+            MODULE, "request_json", return_value={"id": "illust-1", "status": "PROCESSING", "progress": 50}
+        ) as request_json:
+            payload = MODULE.get_illustration_progress(
+                base_url="https://example.com",
+                api_key="sk-gw-test",
+                illustration_id="illust-1",
+                request_timeout=30,
+            )
+
+        self.assertEqual(payload["status"], "PROCESSING")
+        request_json.assert_called_once_with(
+            "GET",
+            "https://example.com/api/v1/illustration/progress/illust-1",
+            api_key="sk-gw-test",
+            timeout=30,
+        )
+
+    def test_get_illustration_detail_calls_correct_endpoint(self) -> None:
+        with mock.patch.object(
+            MODULE, "request_json", return_value={"id": "illust-1", "status": "COMPLETED", "output": {}}
+        ) as request_json:
+            payload = MODULE.get_illustration_detail(
+                base_url="https://example.com",
+                api_key="sk-gw-test",
+                illustration_id="illust-1",
+                request_timeout=30,
+            )
+
+        self.assertEqual(payload["status"], "COMPLETED")
+        request_json.assert_called_once_with(
+            "GET",
+            "https://example.com/api/v1/illustration/detail/illust-1",
+            api_key="sk-gw-test",
+            timeout=30,
+        )
+
+    def test_retry_illustration_calls_correct_endpoint(self) -> None:
+        with mock.patch.object(
+            MODULE, "request_json", return_value={"id": "illust-1", "status": "PENDING", "retry_count": 1}
+        ) as request_json:
+            payload = MODULE.retry_illustration(
+                base_url="https://example.com",
+                api_key="sk-gw-test",
+                illustration_id="illust-1",
+                request_timeout=30,
+            )
+
+        self.assertEqual(payload["retry_count"], 1)
+        request_json.assert_called_once_with(
+            "POST",
+            "https://example.com/api/v1/illustration/retry/illust-1",
+            api_key="sk-gw-test",
+            timeout=30,
+        )
+
+    def test_wait_for_illustration_polls_until_completed(self) -> None:
+        progress_payloads = [
+            {"status": "PENDING", "progress": 0},
+            {"status": "PROCESSING", "progress": 50},
+            {"status": "COMPLETED", "progress": 100},
+        ]
+        detail = {
+            "id": "illust-1",
+            "status": "COMPLETED",
+            "output": {
+                "markdown": "# Title\n\nBody",
+                "images": [],
+                "stats": {"images_generated": 0},
+            },
+        }
+
+        with mock.patch.object(MODULE, "get_illustration_progress", side_effect=progress_payloads):
+            with mock.patch.object(MODULE, "get_illustration_detail", return_value=detail):
+                with mock.patch.object(MODULE.time, "sleep") as sleep:
+                    progress, result = MODULE.wait_for_illustration(
+                        base_url="https://example.com",
+                        api_key="sk-gw-test",
+                        illustration_id="illust-1",
+                        poll_interval=10,
+                        request_timeout=30,
+                        illustration_timeout=60,
+                    )
+
+        self.assertEqual(progress["status"], "COMPLETED")
+        self.assertEqual(result["id"], "illust-1")
+        self.assertEqual(sleep.call_args_list, [mock.call(10), mock.call(10)])
+
+    def test_wait_for_illustration_auto_retries_on_failure(self) -> None:
+        progress_payloads = [
+            {"status": "FAILED", "progress": 0, "can_retry": True, "retry_count": 0},
+            {"status": "PENDING", "progress": 0},
+            {"status": "COMPLETED", "progress": 100},
+        ]
+        detail = {
+            "id": "illust-1",
+            "status": "COMPLETED",
+            "output": {
+                "markdown": "# Title\n\n![Cover](https://cdn.example.com/cover.png)\n\nBody",
+                "images": [{"role": "cover", "url": "https://cdn.example.com/cover.png"}],
+                "stats": {"images_generated": 1},
+            },
+        }
+
+        with mock.patch.object(MODULE, "get_illustration_progress", side_effect=progress_payloads):
+            with mock.patch.object(MODULE, "retry_illustration", return_value={"id": "illust-1", "status": "PENDING", "retry_count": 1}):
+                with mock.patch.object(MODULE, "get_illustration_detail", return_value=detail):
+                    with mock.patch.object(MODULE.time, "sleep") as sleep:
+                        progress, result = MODULE.wait_for_illustration(
+                            base_url="https://example.com",
+                            api_key="sk-gw-test",
+                            illustration_id="illust-1",
+                            poll_interval=10,
+                            request_timeout=30,
+                            illustration_timeout=60,
+                            auto_retry=True,
+                        )
+
+        self.assertEqual(progress["status"], "COMPLETED")
+        self.assertEqual(result["output"]["images"], [{"role": "cover", "url": "https://cdn.example.com/cover.png"}])
+        self.assertEqual(sleep.call_count, 2)
+
+    def test_wait_for_illustration_auto_retries_on_generate_failed(self) -> None:
+        # The live illustration API returns "GENERATE_FAILED", not the
+        # documented "FAILED". Retry must fire for both spellings.
+        progress_payloads = [
+            {"status": "GENERATE_FAILED", "progress": 0, "can_retry": True, "retry_count": 0},
+            {"status": "PENDING", "progress": 0},
+            {"status": "COMPLETED", "progress": 100},
+        ]
+        detail = {
+            "id": "illust-1",
+            "status": "COMPLETED",
+            "output": {
+                "markdown": "# Title\n\n![Cover](https://cdn.example.com/cover.png)\n\nBody",
+                "images": [{"role": "cover", "url": "https://cdn.example.com/cover.png"}],
+                "stats": {"images_generated": 1},
+            },
+        }
+
+        with mock.patch.object(MODULE, "get_illustration_progress", side_effect=progress_payloads):
+            with mock.patch.object(MODULE, "retry_illustration", return_value={"id": "illust-1", "status": "PENDING", "retry_count": 1}):
+                with mock.patch.object(MODULE, "get_illustration_detail", return_value=detail):
+                    with mock.patch.object(MODULE.time, "sleep") as sleep:
+                        progress, result = MODULE.wait_for_illustration(
+                            base_url="https://example.com",
+                            api_key="sk-gw-test",
+                            illustration_id="illust-1",
+                            poll_interval=10,
+                            request_timeout=30,
+                            illustration_timeout=60,
+                            auto_retry=True,
+                        )
+
+        self.assertEqual(progress["status"], "COMPLETED")
+        self.assertEqual(result["output"]["images"], [{"role": "cover", "url": "https://cdn.example.com/cover.png"}])
+        self.assertEqual(sleep.call_count, 2)
+
+    def test_wait_for_illustration_raises_timeout(self) -> None:
+        with mock.patch.object(
+            MODULE, "get_illustration_progress", return_value={"status": "PROCESSING", "progress": 50}
+        ):
+            with mock.patch.object(MODULE.time, "time", side_effect=[0, 0, 61]):
+                with self.assertRaises(TimeoutError):
+                    MODULE.wait_for_illustration(
+                        base_url="https://example.com",
+                        api_key="sk-gw-test",
+                        illustration_id="illust-1",
+                        poll_interval=10,
+                        request_timeout=30,
+                        illustration_timeout=60,
+                    )
+
+    def test_cmd_illustrate_with_markdown_file_creates_bundle(self) -> None:
+        progress = {"status": "COMPLETED", "progress": 100}
+        detail = {
+            "id": "illust-1",
+            "status": "COMPLETED",
+            "output": {
+                "markdown": "# Title\n\n![Cover](https://cdn.example.com/cover.png)\n\nBody text",
+                "images": [
+                    {"role": "cover", "url": "https://cdn.example.com/cover.png", "alt": "Cover", "image_type": "cover", "style": "cinematic", "position": 0, "resolution": "1k", "aspect_ratio": "16:9"},
+                ],
+                "stats": {"images_generated": 1, "duration_ms": 5000},
+            },
+            "error_message": None,
+            "retry_count": 0,
+            "can_retry": False,
+        }
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            md_path = Path(tmp_dir) / "input.md"
+            md_path.write_text("# Title\n\nBody text", encoding="utf-8")
+
+            articles_dir = Path(tmp_dir) / "articles"
+            args = types.SimpleNamespace(
+                markdown_file=str(md_path),
+                article_dir=None,
+                illustration_id=None,
+                idempotency_key=None,
+                cover=True,
+                cover_style="cinematic",
+                max_images=3,
+                image_styles=None,
+                platform="general",
+                aspect_ratio="16:9",
+                resolution="1k",
+                format="json",
+                json_indent=2,
+                env=[],
+                set=[],
+                base_url=None,
+                api_key=None,
+                poll_interval=None,
+                image_poll_interval=None,
+                publish_poll_interval=None,
+                request_timeout=None,
+                generation_timeout=None,
+                publish_timeout=None,
+                illustration_poll_interval=None,
+                illustration_timeout=None,
+                articles_dir=str(articles_dir),
+            )
+            settings = {
+                "base_url": "https://example.com",
+                "api_key": "sk-gw-test",
+                "illustration_poll_interval": 10,
+                "illustration_timeout": 900,
+                "request_timeout": 30,
+                "articles_dir": articles_dir,
+            }
+
+            stdout = io.StringIO()
+            with mock.patch.object(MODULE, "resolve_settings", return_value=settings):
+                with mock.patch.object(MODULE, "create_illustration", return_value={"id": "illust-1", "status": "PENDING", "created_at": "2026-06-07T10:00:00Z"}):
+                    with mock.patch.object(MODULE, "wait_for_illustration", return_value=(progress, detail)):
+                        with mock.patch.object(MODULE, "download_binary", return_value=(b"png", "image/png")):
+                            with redirect_stdout(stdout):
+                                exit_code = MODULE.cmd_illustrate(args)
+
+            self.assertEqual(exit_code, 0)
+
+            summary = json.loads(stdout.getvalue())
+            self.assertEqual(summary["illustration_id"], "illust-1")
+            self.assertEqual(summary["status"], "COMPLETED")
+            self.assertEqual(summary["images_count"], 1)
+            self.assertNotIn("cost_usd", summary)
+
+            # Find the created bundle dir
+            bundle_dirs = list(articles_dir.iterdir())
+            self.assertEqual(len(bundle_dirs), 1)
+            bundle = bundle_dirs[0]
+
+            illustrated_path = bundle / "illustrated.md"
+            manifest_path = bundle / "manifest.json"
+            illustration_path = bundle / "illustration.json"
+            image_path = bundle / "images" / "image-1.png"
+
+            self.assertTrue(illustrated_path.exists())
+            self.assertTrue(manifest_path.exists())
+            self.assertTrue(illustration_path.exists())
+            self.assertTrue(image_path.exists())
+
+            illustrated = illustrated_path.read_text(encoding="utf-8")
+            self.assertIn("images/image-1.png", illustrated)
+            self.assertNotIn("https://cdn.example.com/cover.png", illustrated)
+
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(manifest["illustration"]["id"], "illust-1")
+            self.assertEqual(manifest["illustration"]["status"], "COMPLETED")
+
+    def test_cmd_illustrate_with_article_dir_reads_existing_markdown(self) -> None:
+        progress = {"status": "COMPLETED", "progress": 100}
+        detail = {
+            "id": "illust-2",
+            "status": "COMPLETED",
+            "output": {
+                "markdown": "# Existing Article\n\n![Img](https://cdn.example.com/img.png)\n\nContent",
+                "images": [{"role": "body", "url": "https://cdn.example.com/img.png"}],
+                "stats": {"images_generated": 1},
+            },
+            "error_message": None,
+            "retry_count": 0,
+            "can_retry": False,
+        }
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            article_dir = Path(tmp_dir) / "bundle"
+            article_dir.mkdir(parents=True)
+            (article_dir / "article.md").write_text("# Existing Article\n\nContent", encoding="utf-8")
+            (article_dir / "manifest.json").write_text(json.dumps({
+                "article_key": "key-1",
+                "keyword": "existing",
+                "document_id": "doc-1",
+            }), encoding="utf-8")
+
+            args = types.SimpleNamespace(
+                markdown_file=None,
+                article_dir=str(article_dir),
+                illustration_id=None,
+                idempotency_key=None,
+                cover=True,
+                cover_style="cinematic",
+                max_images=3,
+                image_styles=None,
+                platform="general",
+                aspect_ratio="16:9",
+                resolution="1k",
+                format="path",
+                json_indent=2,
+                env=[],
+                set=[],
+                base_url=None,
+                api_key=None,
+                poll_interval=None,
+                image_poll_interval=None,
+                publish_poll_interval=None,
+                request_timeout=None,
+                generation_timeout=None,
+                publish_timeout=None,
+                illustration_poll_interval=None,
+                illustration_timeout=None,
+                articles_dir=None,
+            )
+            settings = {
+                "base_url": "https://example.com",
+                "api_key": "sk-gw-test",
+                "illustration_poll_interval": 10,
+                "illustration_timeout": 900,
+                "request_timeout": 30,
+                "articles_dir": Path(tmp_dir),
+            }
+
+            stdout = io.StringIO()
+            with mock.patch.object(MODULE, "resolve_settings", return_value=settings):
+                with mock.patch.object(MODULE, "create_illustration", return_value={"id": "illust-2", "status": "PENDING"}):
+                    with mock.patch.object(MODULE, "wait_for_illustration", return_value=(progress, detail)):
+                        with mock.patch.object(MODULE, "download_binary", return_value=(b"png", "image/png")):
+                            with redirect_stdout(stdout):
+                                exit_code = MODULE.cmd_illustrate(args)
+
+            self.assertEqual(exit_code, 0)
+
+            # Original article.md should be preserved
+            original_md = (article_dir / "article.md").read_text(encoding="utf-8")
+            self.assertEqual(original_md, "# Existing Article\n\nContent")
+
+            # illustrated.md should exist with localized images
+            self.assertTrue((article_dir / "illustrated.md").exists())
+            illustrated = (article_dir / "illustrated.md").read_text(encoding="utf-8")
+            self.assertIn("images/image-1.png", illustrated)
+
+            self.assertEqual(stdout.getvalue().strip(), str(article_dir / "illustrated.md"))
+
+    def test_cmd_illustrate_resumes_existing_illustration(self) -> None:
+        progress = {"status": "COMPLETED", "progress": 100}
+        detail = {
+            "id": "illust-3",
+            "status": "COMPLETED",
+            "output": {
+                "markdown": "# Title\n\nBody",
+                "images": [],
+                "stats": {},
+            },
+            "error_message": None,
+            "retry_count": 0,
+            "can_retry": False,
+        }
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            article_dir = Path(tmp_dir) / "bundle"
+            article_dir.mkdir(parents=True)
+            (article_dir / "article.md").write_text("# Title\n\nBody", encoding="utf-8")
+            (article_dir / "manifest.json").write_text(json.dumps({
+                "article_key": "key-1",
+                "illustration": {"id": "illust-3"},
+            }), encoding="utf-8")
+
+            args = types.SimpleNamespace(
+                markdown_file=None,
+                article_dir=str(article_dir),
+                illustration_id=None,
+                idempotency_key=None,
+                cover=True,
+                cover_style="cinematic",
+                max_images=3,
+                image_styles=None,
+                platform="general",
+                aspect_ratio="16:9",
+                resolution="1k",
+                format="json",
+                json_indent=2,
+                env=[],
+                set=[],
+                base_url=None,
+                api_key=None,
+                poll_interval=None,
+                image_poll_interval=None,
+                publish_poll_interval=None,
+                request_timeout=None,
+                generation_timeout=None,
+                publish_timeout=None,
+                illustration_poll_interval=None,
+                illustration_timeout=None,
+                articles_dir=None,
+            )
+            settings = {
+                "base_url": "https://example.com",
+                "api_key": "sk-gw-test",
+                "illustration_poll_interval": 10,
+                "illustration_timeout": 900,
+                "request_timeout": 30,
+                "articles_dir": Path(tmp_dir),
+            }
+
+            stdout = io.StringIO()
+            with mock.patch.object(MODULE, "resolve_settings", return_value=settings):
+                with mock.patch.object(MODULE, "get_illustration_progress", return_value=progress):
+                    with mock.patch.object(MODULE, "get_illustration_detail", return_value=detail):
+                        with mock.patch.object(MODULE, "create_illustration") as create_illustration:
+                            with redirect_stdout(stdout):
+                                exit_code = MODULE.cmd_illustrate(args)
+
+            self.assertEqual(exit_code, 0)
+            create_illustration.assert_not_called()
+
+            summary = json.loads(stdout.getvalue())
+            self.assertEqual(summary["status"], "COMPLETED")
+
+    def test_cmd_illustrate_returns_failure_on_failed_status(self) -> None:
+        # Both the documented "FAILED" and the live "GENERATE_FAILED" statuses
+        # must be treated as failures. Before the fix, "GENERATE_FAILED" fell
+        # through to the success path and wrote an empty illustrated.md.
+        for api_status in ("FAILED", "GENERATE_FAILED"):
+            with self.subTest(status=api_status):
+                progress = {"status": api_status, "progress": 0, "can_retry": False}
+                detail = {
+                    "id": "illust-4",
+                    "status": api_status,
+                    "output": None,
+                    "error_message": "Image generation failed",
+                    "retry_count": 0,
+                    "can_retry": False,
+                }
+
+                with tempfile.TemporaryDirectory() as tmp_dir:
+                    article_dir = Path(tmp_dir) / "bundle"
+                    article_dir.mkdir(parents=True)
+                    (article_dir / "article.md").write_text("# Title\n\nBody", encoding="utf-8")
+                    (article_dir / "manifest.json").write_text(json.dumps({
+                        "article_key": "key-1",
+                    }), encoding="utf-8")
+
+                    args = types.SimpleNamespace(
+                        markdown_file=None,
+                        article_dir=str(article_dir),
+                        illustration_id=None,
+                        idempotency_key=None,
+                        cover=True,
+                        cover_style="cinematic",
+                        max_images=3,
+                        image_styles=None,
+                        platform="general",
+                        aspect_ratio="16:9",
+                        resolution="1k",
+                        format="json",
+                        json_indent=2,
+                        env=[],
+                        set=[],
+                        base_url=None,
+                        api_key=None,
+                        poll_interval=None,
+                        image_poll_interval=None,
+                        publish_poll_interval=None,
+                        request_timeout=None,
+                        generation_timeout=None,
+                        publish_timeout=None,
+                        illustration_poll_interval=None,
+                        illustration_timeout=None,
+                        articles_dir=None,
+                    )
+                    settings = {
+                        "base_url": "https://example.com",
+                        "api_key": "sk-gw-test",
+                        "illustration_poll_interval": 10,
+                        "illustration_timeout": 900,
+                        "request_timeout": 30,
+                        "articles_dir": Path(tmp_dir),
+                    }
+
+                    stdout = io.StringIO()
+                    with mock.patch.object(MODULE, "resolve_settings", return_value=settings):
+                        with mock.patch.object(MODULE, "create_illustration", return_value={"id": "illust-4", "status": "PENDING"}):
+                            with mock.patch.object(MODULE, "wait_for_illustration", return_value=(progress, detail)):
+                                with redirect_stdout(stdout):
+                                    exit_code = MODULE.cmd_illustrate(args)
+
+                    self.assertEqual(exit_code, 1)
+
+                    summary = json.loads(stdout.getvalue())
+                    self.assertEqual(summary["status"], "FAILED")
+                    self.assertEqual(summary["error_message"], "Image generation failed")
+
+    def test_cmd_illustrate_validates_markdown_length(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            md_path = Path(tmp_dir) / "long.md"
+            md_path.write_text("x" * 50001, encoding="utf-8")
+
+            args = types.SimpleNamespace(
+                markdown_file=str(md_path),
+                article_dir=None,
+                illustration_id=None,
+                idempotency_key=None,
+                cover=True,
+                cover_style="cinematic",
+                max_images=3,
+                image_styles=None,
+                platform="general",
+                aspect_ratio="16:9",
+                resolution="1k",
+                format="json",
+                json_indent=2,
+                env=[],
+                set=[],
+                base_url=None,
+                api_key=None,
+                poll_interval=None,
+                image_poll_interval=None,
+                publish_poll_interval=None,
+                request_timeout=None,
+                generation_timeout=None,
+                publish_timeout=None,
+                illustration_poll_interval=None,
+                illustration_timeout=None,
+                articles_dir=str(Path(tmp_dir) / "articles"),
+            )
+            settings = {
+                "base_url": "https://example.com",
+                "api_key": "sk-gw-test",
+                "illustration_poll_interval": 10,
+                "illustration_timeout": 900,
+                "request_timeout": 30,
+                "articles_dir": Path(tmp_dir) / "articles",
+            }
+
+            with mock.patch.object(MODULE, "resolve_settings", return_value=settings):
+                with self.assertRaises(ValueError) as ctx:
+                    MODULE.cmd_illustrate(args)
+
+            self.assertIn("50000", str(ctx.exception))
 
 
 if __name__ == "__main__":

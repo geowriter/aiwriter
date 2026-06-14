@@ -33,6 +33,8 @@ DEFAULTS = {
     "GW_REQUEST_TIMEOUT_SECONDS": "30",
     "GW_GENERATION_TIMEOUT_SECONDS": "900",
     "GW_PUBLISH_TIMEOUT_SECONDS": "600",
+    "GW_ILLUSTRATION_POLL_INTERVAL_SECONDS": "10",
+    "GW_ILLUSTRATION_TIMEOUT_SECONDS": "900",
     "GW_ARTICLES_DIR": str(SKILL_ROOT / "output" / "articles"),
 }
 
@@ -45,6 +47,10 @@ DEFAULT_DOWNLOAD_USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0 Safari/537.36"
 )
 RETRYABLE_HTTP_STATUS_CODES = {408, 425, 429, 500, 502, 503, 504}
+# The illustration API documents failure as "FAILED", but the live service
+# returns "GENERATE_FAILED". Treat both as terminal failures so the retry path
+# (POST /api/v1/illustration/retry/{id}) fires when can_retry is true.
+ILLUSTRATION_FAILED_STATUSES = {"FAILED", "GENERATE_FAILED"}
 
 
 class ApiError(RuntimeError):
@@ -143,6 +149,8 @@ def build_env_content(values: dict[str, str]) -> str:
         f"GW_REQUEST_TIMEOUT_SECONDS={values['GW_REQUEST_TIMEOUT_SECONDS']}",
         f"GW_GENERATION_TIMEOUT_SECONDS={values['GW_GENERATION_TIMEOUT_SECONDS']}",
         f"GW_PUBLISH_TIMEOUT_SECONDS={values['GW_PUBLISH_TIMEOUT_SECONDS']}",
+        f"GW_ILLUSTRATION_POLL_INTERVAL_SECONDS={values['GW_ILLUSTRATION_POLL_INTERVAL_SECONDS']}",
+        f"GW_ILLUSTRATION_TIMEOUT_SECONDS={values['GW_ILLUSTRATION_TIMEOUT_SECONDS']}",
         "",
         "# Local article bundle root",
         f"GW_ARTICLES_DIR={values['GW_ARTICLES_DIR']}",
@@ -218,6 +226,8 @@ def bundle_paths(article_dir: Path) -> dict[str, Path]:
         "document": article_dir / "document.json",
         "generation": article_dir / "generation.json",
         "publish": article_dir / "publish.json",
+        "illustrated": article_dir / "illustrated.md",
+        "illustration": article_dir / "illustration.json",
         "images": article_dir / "images",
     }
 
@@ -274,6 +284,10 @@ def resolve_settings(args: argparse.Namespace) -> dict[str, Any]:
         env_values["GW_GENERATION_TIMEOUT_SECONDS"] = str(args.generation_timeout)
     if getattr(args, "publish_timeout", None) is not None:
         env_values["GW_PUBLISH_TIMEOUT_SECONDS"] = str(args.publish_timeout)
+    if getattr(args, "illustration_poll_interval", None) is not None:
+        env_values["GW_ILLUSTRATION_POLL_INTERVAL_SECONDS"] = str(args.illustration_poll_interval)
+    if getattr(args, "illustration_timeout", None) is not None:
+        env_values["GW_ILLUSTRATION_TIMEOUT_SECONDS"] = str(args.illustration_timeout)
     if getattr(args, "articles_dir", None):
         env_values["GW_ARTICLES_DIR"] = args.articles_dir
 
@@ -291,6 +305,8 @@ def resolve_settings(args: argparse.Namespace) -> dict[str, Any]:
         "request_timeout": int(env_values["GW_REQUEST_TIMEOUT_SECONDS"]),
         "generation_timeout": int(env_values["GW_GENERATION_TIMEOUT_SECONDS"]),
         "publish_timeout": int(env_values["GW_PUBLISH_TIMEOUT_SECONDS"]),
+        "illustration_poll_interval": int(env_values["GW_ILLUSTRATION_POLL_INTERVAL_SECONDS"]),
+        "illustration_timeout": int(env_values["GW_ILLUSTRATION_TIMEOUT_SECONDS"]),
         "articles_dir": Path(env_values["GW_ARTICLES_DIR"]).expanduser(),
     }
 
@@ -310,6 +326,7 @@ def request_json(
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Accept": "application/json",
+        "User-Agent": DEFAULT_DOWNLOAD_USER_AGENT,
     }
 
     if payload is not None:
@@ -538,6 +555,89 @@ def get_publish_progress(*, base_url: str, api_key: str, document_id: str, reque
     )
 
 
+def create_illustration(
+    *,
+    base_url: str,
+    api_key: str,
+    markdown: str,
+    cover: bool = True,
+    cover_style: str = "cinematic",
+    max_images: int = 3,
+    image_styles: list[str] | None = None,
+    platform: str = "general",
+    aspect_ratio: str = "16:9",
+    resolution: str = "1k",
+    idempotency_key: str | None = None,
+    request_timeout: int = 30,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "markdown": markdown,
+        "cover": cover,
+        "cover_style": cover_style,
+        "max_images": max_images,
+        "platform": platform,
+        "aspect_ratio": aspect_ratio,
+        "resolution": resolution,
+    }
+    if image_styles is not None:
+        payload["image_styles"] = image_styles
+    if idempotency_key is not None:
+        payload["idempotency_key"] = idempotency_key
+    return request_json(
+        "POST",
+        f"{base_url}/api/v1/illustration/create",
+        api_key=api_key,
+        payload=payload,
+        timeout=request_timeout,
+        retryable=True,
+    )
+
+
+def get_illustration_progress(
+    *,
+    base_url: str,
+    api_key: str,
+    illustration_id: str,
+    request_timeout: int,
+) -> dict[str, Any]:
+    return request_json(
+        "GET",
+        f"{base_url}/api/v1/illustration/progress/{illustration_id}",
+        api_key=api_key,
+        timeout=request_timeout,
+    )
+
+
+def get_illustration_detail(
+    *,
+    base_url: str,
+    api_key: str,
+    illustration_id: str,
+    request_timeout: int,
+) -> dict[str, Any]:
+    return request_json(
+        "GET",
+        f"{base_url}/api/v1/illustration/detail/{illustration_id}",
+        api_key=api_key,
+        timeout=request_timeout,
+    )
+
+
+def retry_illustration(
+    *,
+    base_url: str,
+    api_key: str,
+    illustration_id: str,
+    request_timeout: int,
+) -> dict[str, Any]:
+    return request_json(
+        "POST",
+        f"{base_url}/api/v1/illustration/retry/{illustration_id}",
+        api_key=api_key,
+        timeout=request_timeout,
+    )
+
+
 def resolve_poll_interval(progress: dict[str, Any], default_poll_interval: int, image_poll_interval: int) -> int:
     stage_name = str(progress.get("stage_name") or "")
     stage = progress.get("stage")
@@ -633,7 +733,135 @@ def wait_for_publish(
         time.sleep(poll_interval)
 
 
-def format_document_markdown(document: dict[str, Any]) -> str:
+def wait_for_illustration(
+    *,
+    base_url: str,
+    api_key: str,
+    illustration_id: str,
+    poll_interval: int,
+    request_timeout: int,
+    illustration_timeout: int,
+    auto_retry: bool = True,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    started_at = time.time()
+    log_long_running_notice("Illustration")
+
+    while True:
+        progress = get_illustration_progress(
+            base_url=base_url,
+            api_key=api_key,
+            illustration_id=illustration_id,
+            request_timeout=request_timeout,
+        )
+
+        status = progress.get("status", "UNKNOWN")
+        percent = progress.get("progress", 0)
+        print(f"[aiwriter] illustrate {percent}% | {status}", file=sys.stderr)
+
+        if status == "COMPLETED":
+            detail = get_illustration_detail(
+                base_url=base_url,
+                api_key=api_key,
+                illustration_id=illustration_id,
+                request_timeout=request_timeout,
+            )
+            return progress, detail
+
+        if status in ILLUSTRATION_FAILED_STATUSES:
+            if auto_retry and progress.get("can_retry"):
+                print(
+                    f"[aiwriter] Illustration failed, retrying (attempt {progress.get('retry_count', 0) + 1})...",
+                    file=sys.stderr,
+                )
+                retry_illustration(
+                    base_url=base_url,
+                    api_key=api_key,
+                    illustration_id=illustration_id,
+                    request_timeout=request_timeout,
+                )
+                time.sleep(poll_interval)
+                continue
+            detail = get_illustration_detail(
+                base_url=base_url,
+                api_key=api_key,
+                illustration_id=illustration_id,
+                request_timeout=request_timeout,
+            )
+            return progress, detail
+
+        if status not in ("PENDING", "PROCESSING", "GENERATING"):
+            detail = get_illustration_detail(
+                base_url=base_url,
+                api_key=api_key,
+                illustration_id=illustration_id,
+                request_timeout=request_timeout,
+            )
+            return progress, detail
+
+        if (time.time() - started_at) >= illustration_timeout:
+            raise TimeoutError(
+                f"Timed out after {illustration_timeout} seconds waiting for illustration {illustration_id}."
+            )
+
+        time.sleep(poll_interval)
+
+
+def sync_illustrated_bundle(
+    *,
+    article_dir: Path,
+    manifest: dict[str, Any],
+    paths: dict[str, Path],
+    detail: dict[str, Any],
+    progress: dict[str, Any],
+    illustration_state: dict[str, Any],
+    request_timeout: int,
+) -> dict[str, Any]:
+    output = detail.get("output") or {}
+    markdown = (output.get("markdown") or "").rstrip() + "\n"
+
+    markdown, image_failures = localize_markdown_images(
+        markdown,
+        images_dir=paths["images"],
+        request_timeout=request_timeout,
+    )
+
+    write_text_file(paths["illustrated"], markdown)
+
+    illustration_state["final_progress"] = progress
+    illustration_state["detail"] = detail
+    illustration_state["image_failures"] = image_failures
+    illustration_state["completed_at"] = utc_now_iso()
+    write_json_file(paths["illustration"], illustration_state)
+
+    stats = output.get("stats") or {}
+    images_info = output.get("images") or []
+    manifest.update(
+        {
+            "illustration": {
+                "id": detail.get("id"),
+                "status": detail.get("status"),
+                "error_message": detail.get("error_message"),
+                "retry_count": detail.get("retry_count", 0),
+                "can_retry": detail.get("can_retry", False),
+                "images_count": len(images_info),
+                "duration_ms": stats.get("duration_ms"),
+                "illustrated_at": utc_now_iso(),
+            },
+            "updated_at": utc_now_iso(),
+        }
+    )
+    write_json_file(paths["manifest"], manifest)
+
+    return {
+        "article_dir": str(article_dir),
+        "illustrated_path": str(paths["illustrated"]),
+        "manifest_path": str(paths["manifest"]),
+        "illustration_path": str(paths["illustration"]),
+        "illustration_id": detail.get("id"),
+        "status": detail.get("status"),
+        "images_count": len(images_info),
+        "image_failures": image_failures,
+    }
     title = (document.get("title") or "Untitled").strip()
     excerpt = (document.get("excerpt") or "").strip()
     body = (document.get("body") or "").rstrip()
@@ -662,6 +890,15 @@ def infer_image_extension(url: str, content_type: str | None) -> str:
     return ".bin"
 
 
+def normalize_image_url(url: str) -> str:
+    # The image service has been emitting URLs with an explicit non-standard
+    # port (e.g. https://imager.geowriter.ai:8081/images/...) that is not
+    # publicly reachable — downloads, proxies, and browsers all fail on it,
+    # while the same images are served on standard HTTPS (443) at the bare
+    # host. Drop the port so both local download and rendered output resolve.
+    return re.sub(r"(https://imager\.geowriter\.ai):\d+(/)", r"\1\2", url)
+
+
 def localize_markdown_images(
     markdown: str,
     *,
@@ -674,7 +911,7 @@ def localize_markdown_images(
     images_dir.mkdir(parents=True, exist_ok=True)
 
     def replace(match: re.Match[str]) -> str:
-        image_url = match.group("url")
+        image_url = normalize_image_url(match.group("url"))
         tail = match.group("tail") or ""
 
         if image_url in cache:
@@ -684,7 +921,7 @@ def localize_markdown_images(
             data, content_type = download_binary(image_url, timeout=request_timeout)
         except ApiError:
             failures.append(image_url)
-            return match.group(0)
+            return f"![{match.group('alt')}]({image_url}{tail})"
 
         extension = infer_image_extension(image_url, content_type)
         filename = f"image-{len(cache) + 1}{extension}"
@@ -761,6 +998,24 @@ def prepare_article_bundle(args: argparse.Namespace, settings: dict[str, Any]) -
     }
     write_json_file(paths["manifest"], manifest)
     return article_dir, manifest, paths
+
+
+
+def format_document_markdown(document: dict[str, Any]) -> str:
+    title = (document.get("title") or "Untitled").strip()
+    excerpt = (document.get("excerpt") or "").strip()
+    body = (document.get("body") or "").rstrip()
+
+    parts = [f"# {title}", ""]
+
+    if excerpt:
+        parts.extend([excerpt, ""])
+
+    if body:
+        parts.append(body)
+        parts.append("")
+
+    return "\n".join(parts).rstrip() + "\n"
 
 
 def sync_generated_bundle(
@@ -846,6 +1101,14 @@ def cmd_init(args: argparse.Namespace) -> int:
         ),
         "GW_PUBLISH_TIMEOUT_SECONDS": str(
             args.publish_timeout or prompt_value("Publish timeout seconds", example_values["GW_PUBLISH_TIMEOUT_SECONDS"])
+        ),
+        "GW_ILLUSTRATION_POLL_INTERVAL_SECONDS": str(
+            args.illustration_poll_interval
+            or prompt_value("Illustration poll interval seconds", example_values["GW_ILLUSTRATION_POLL_INTERVAL_SECONDS"])
+        ),
+        "GW_ILLUSTRATION_TIMEOUT_SECONDS": str(
+            args.illustration_timeout
+            or prompt_value("Illustration timeout seconds", example_values["GW_ILLUSTRATION_TIMEOUT_SECONDS"])
         ),
         "GW_ARTICLES_DIR": args.articles_dir or prompt_value("Article bundle root", example_values["GW_ARTICLES_DIR"]),
     }
@@ -1035,6 +1298,197 @@ def cmd_publish(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_illustrate(args: argparse.Namespace) -> int:
+    settings = resolve_settings(args)
+
+    # Determine source of markdown content
+    if args.article_dir:
+        article_dir = Path(args.article_dir).expanduser()
+        paths = bundle_paths(article_dir)
+        manifest = load_json_file(paths["manifest"], {})
+        if not manifest and not paths["markdown"].exists():
+            raise ValueError(f"Article bundle not found and no article.md at: {article_dir}")
+        markdown = paths["markdown"].read_text(encoding="utf-8")
+    elif args.markdown_file:
+        markdown_path = Path(args.markdown_file).expanduser()
+        if not markdown_path.exists():
+            raise FileNotFoundError(f"Markdown file not found: {markdown_path}")
+        markdown = markdown_path.read_text(encoding="utf-8")
+
+        slug = slugify(markdown_path.stem)
+        timestamp = datetime.now()
+        dirname = f"{slug}-{timestamp:%Y%m%d-%H%M%S}"
+        article_dir = settings["articles_dir"] / dirname
+        article_dir.mkdir(parents=True, exist_ok=True)
+        paths = bundle_paths(article_dir)
+        manifest = load_json_file(paths["manifest"], {})
+        if not paths["markdown"].exists():
+            write_text_file(paths["markdown"], markdown)
+    else:
+        raise ValueError("Either a markdown file path or --article-dir is required.")
+
+    if len(markdown) < 1:
+        raise ValueError("Markdown content is empty.")
+    if len(markdown) > 50000:
+        raise ValueError(f"Markdown content exceeds 50000 characters ({len(markdown)} chars).")
+
+    illustration_state = load_json_file(paths["illustration"], {})
+
+    # Check for existing illustration_id to support resume
+    illustration_id = (
+        args.illustration_id
+        or manifest.get("illustration", {}).get("id")
+        or illustration_state.get("create_response", {}).get("id")
+    )
+
+    if illustration_id:
+        # Resume: poll existing illustration
+        progress = get_illustration_progress(
+            base_url=settings["base_url"],
+            api_key=settings["api_key"],
+            illustration_id=str(illustration_id),
+            request_timeout=settings["request_timeout"],
+        )
+        status = progress.get("status", "")
+
+        if status == "COMPLETED":
+            detail = get_illustration_detail(
+                base_url=settings["base_url"],
+                api_key=settings["api_key"],
+                illustration_id=str(illustration_id),
+                request_timeout=settings["request_timeout"],
+            )
+        elif status in ILLUSTRATION_FAILED_STATUSES and progress.get("can_retry"):
+            progress, detail = wait_for_illustration(
+                base_url=settings["base_url"],
+                api_key=settings["api_key"],
+                illustration_id=str(illustration_id),
+                poll_interval=settings["illustration_poll_interval"],
+                request_timeout=settings["request_timeout"],
+                illustration_timeout=settings["illustration_timeout"],
+                auto_retry=True,
+            )
+        elif status in ("PENDING", "PROCESSING", "GENERATING"):
+            progress, detail = wait_for_illustration(
+                base_url=settings["base_url"],
+                api_key=settings["api_key"],
+                illustration_id=str(illustration_id),
+                poll_interval=settings["illustration_poll_interval"],
+                request_timeout=settings["request_timeout"],
+                illustration_timeout=settings["illustration_timeout"],
+            )
+        else:
+            detail = get_illustration_detail(
+                base_url=settings["base_url"],
+                api_key=settings["api_key"],
+                illustration_id=str(illustration_id),
+                request_timeout=settings["request_timeout"],
+            )
+    else:
+        # Create new illustration task
+        idempotency_key = args.idempotency_key or str(uuid.uuid4())
+        image_styles = args.image_styles.split(",") if args.image_styles else None
+
+        create_response = create_illustration(
+            base_url=settings["base_url"],
+            api_key=settings["api_key"],
+            markdown=markdown,
+            cover=args.cover,
+            cover_style=args.cover_style,
+            max_images=args.max_images,
+            image_styles=image_styles,
+            platform=args.platform,
+            aspect_ratio=args.aspect_ratio,
+            resolution=args.resolution,
+            idempotency_key=idempotency_key,
+            request_timeout=settings["request_timeout"],
+        )
+        illustration_id = str(create_response["id"])
+
+        illustration_state["request"] = {
+            "markdown_length": len(markdown),
+            "cover": args.cover,
+            "cover_style": args.cover_style,
+            "max_images": args.max_images,
+            "image_styles": image_styles,
+            "platform": args.platform,
+            "aspect_ratio": args.aspect_ratio,
+            "resolution": args.resolution,
+            "idempotency_key": idempotency_key,
+        }
+        illustration_state["create_response"] = create_response
+        write_json_file(paths["illustration"], illustration_state)
+
+        manifest.setdefault("illustration", {})
+        manifest["illustration"]["id"] = illustration_id
+        manifest["updated_at"] = utc_now_iso()
+        if not manifest.get("created_at"):
+            manifest["created_at"] = utc_now_iso()
+        manifest["article_dir"] = str(article_dir)
+        manifest.setdefault("files", {
+            "markdown": paths["markdown"].name,
+            "illustrated": paths["illustrated"].name,
+            "illustration": paths["illustration"].name,
+            "images_dir": paths["images"].name,
+        })
+        write_json_file(paths["manifest"], manifest)
+
+        progress, detail = wait_for_illustration(
+            base_url=settings["base_url"],
+            api_key=settings["api_key"],
+            illustration_id=illustration_id,
+            poll_interval=settings["illustration_poll_interval"],
+            request_timeout=settings["request_timeout"],
+            illustration_timeout=settings["illustration_timeout"],
+        )
+
+    # Check final status
+    final_status = detail.get("status") or progress.get("status")
+    if final_status in ILLUSTRATION_FAILED_STATUSES:
+        error_message = detail.get("error_message") or progress.get("error_message") or "Illustration failed."
+        illustration_state["final_progress"] = progress
+        illustration_state["detail"] = detail
+        illustration_state["failed_at"] = utc_now_iso()
+        write_json_file(paths["illustration"], illustration_state)
+
+        manifest.setdefault("illustration", {})
+        manifest["illustration"]["status"] = "FAILED"
+        manifest["illustration"]["error_message"] = error_message
+        manifest["updated_at"] = utc_now_iso()
+        write_json_file(paths["manifest"], manifest)
+
+        summary = {
+            "article_dir": str(article_dir),
+            "illustration_id": str(illustration_id),
+            "status": "FAILED",
+            "error_message": error_message,
+            "can_retry": detail.get("can_retry", progress.get("can_retry", False)),
+        }
+        if args.format == "json":
+            sys.stdout.write(json.dumps(summary, ensure_ascii=False, indent=args.json_indent) + "\n")
+        else:
+            print(f"FAILED: {error_message}", file=sys.stderr)
+        return 1
+
+    # Success: sync the full bundle
+    summary = sync_illustrated_bundle(
+        article_dir=article_dir,
+        manifest=manifest,
+        paths=paths,
+        detail=detail,
+        progress=progress,
+        illustration_state=illustration_state,
+        request_timeout=settings["request_timeout"],
+    )
+
+    if args.format == "json":
+        sys.stdout.write(json.dumps(summary, ensure_ascii=False, indent=args.json_indent) + "\n")
+    else:
+        sys.stdout.write(f"{summary['illustrated_path']}\n")
+
+    return 0
+
+
 def cmd_configs(args: argparse.Namespace) -> int:
     settings = resolve_settings(args)
     payload = list_publish_configs(
@@ -1069,6 +1523,8 @@ def add_common_runtime_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--request-timeout", type=int, help="Override GW_REQUEST_TIMEOUT_SECONDS.")
     parser.add_argument("--generation-timeout", type=int, help="Override GW_GENERATION_TIMEOUT_SECONDS.")
     parser.add_argument("--publish-timeout", type=int, help="Override GW_PUBLISH_TIMEOUT_SECONDS.")
+    parser.add_argument("--illustration-poll-interval", type=int, help="Override GW_ILLUSTRATION_POLL_INTERVAL_SECONDS.")
+    parser.add_argument("--illustration-timeout", type=int, help="Override GW_ILLUSTRATION_TIMEOUT_SECONDS.")
     parser.add_argument("--articles-dir", help="Override GW_ARTICLES_DIR.")
 
 
@@ -1107,6 +1563,8 @@ def build_parser() -> argparse.ArgumentParser:
     init_parser.add_argument("--request-timeout", type=int, help="Per-request timeout seconds.")
     init_parser.add_argument("--generation-timeout", type=int, help="End-to-end generation timeout seconds.")
     init_parser.add_argument("--publish-timeout", type=int, help="End-to-end publish timeout seconds.")
+    init_parser.add_argument("--illustration-poll-interval", type=int, help="Illustration poll interval seconds.")
+    init_parser.add_argument("--illustration-timeout", type=int, help="End-to-end illustration timeout seconds.")
     init_parser.add_argument("--articles-dir", help="Default local article bundle root.")
     init_parser.add_argument("--force", action="store_true", help="Overwrite an existing .env file.")
     init_parser.set_defaults(func=cmd_init)
@@ -1136,6 +1594,23 @@ def build_parser() -> argparse.ArgumentParser:
     taxonomy_parser.add_argument("--json-indent", type=int, default=2, help="Indent for JSON output.")
     add_common_runtime_options(taxonomy_parser)
     taxonomy_parser.set_defaults(func=cmd_taxonomy)
+
+    illustrate_parser = subparsers.add_parser("illustrate", help="Add illustrations to a markdown article.")
+    illustrate_parser.add_argument("markdown_file", nargs="?", help="Path to a markdown file. Optional when using --article-dir.")
+    illustrate_parser.add_argument("--article-dir", help="Existing article bundle directory (reads article.md).")
+    illustrate_parser.add_argument("--illustration-id", help="Existing illustration task ID to resume polling.")
+    illustrate_parser.add_argument("--idempotency-key", help="Idempotency key for create request.")
+    illustrate_parser.add_argument("--cover", default=True, action=argparse.BooleanOptionalAction, help="Generate cover image (default: true).")
+    illustrate_parser.add_argument("--cover-style", default="cinematic", help="Cover image style. Valid: tech, minimal, editorial, cinematic, flat, abstract, sketch, watercolor, isometric, ink, comic, retro (default: cinematic).")
+    illustrate_parser.add_argument("--max-images", type=int, default=3, help="Maximum body images to generate, 0-5. Set 0 for cover only (default: 3).")
+    illustrate_parser.add_argument("--image-styles", help="Comma-separated style presets for body images.")
+    illustrate_parser.add_argument("--platform", default="general", help="Target platform (default: general).")
+    illustrate_parser.add_argument("--aspect-ratio", default="16:9", help="Image aspect ratio. Valid: 16:9, 1:1, 3:2, 4:3, 3:4, 9:16, 2:1, 1:2, 21:9, 9:21 (default: 16:9).")
+    illustrate_parser.add_argument("--resolution", default="1k", help="Image resolution. Valid: 1k, 2k (default: 1k).")
+    illustrate_parser.add_argument("--format", choices=["path", "json"], default="path", help="CLI output format.")
+    illustrate_parser.add_argument("--json-indent", type=int, default=2, help="Indent for JSON output.")
+    add_common_runtime_options(illustrate_parser)
+    illustrate_parser.set_defaults(func=cmd_illustrate)
 
     return parser
 
